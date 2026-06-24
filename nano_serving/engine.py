@@ -130,9 +130,11 @@ class LLMEngine:
 
         # ── Decode ────────────────────────────────────────────────────────
         if batch.decode_seqs:
-            last_tokens  = [s.last_token_id     for s in batch.decode_seqs]
-            block_tables = [s.block_table        for s in batch.decode_seqs]
-            seq_lens     = [s.num_total_tokens   for s in batch.decode_seqs]
+            last_tokens  = [s.last_token_id         for s in batch.decode_seqs]
+            block_tables = [s.block_table            for s in batch.decode_seqs]
+            # num_total_tokens includes the last generated token whose KV hasn't
+            # been written to cache yet — cache holds (total - 1) tokens.
+            seq_lens     = [s.num_total_tokens - 1   for s in batch.decode_seqs]
 
             next_tokens = self.model_runner.decode(
                 last_tokens, block_tables, seq_lens

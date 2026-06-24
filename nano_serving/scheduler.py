@@ -120,6 +120,7 @@ class Scheduler:
                 self._waiting.appendleft(seq)   # re-queue with priority
             else:
                 self.block_manager.append_token(seq.seq_id)
+                seq.block_table = self.block_manager.get_block_table(seq.seq_id)
                 out.decode_seqs.append(seq)
                 budgeted_tokens += 1
                 still_running.append(seq)
@@ -142,6 +143,7 @@ class Scheduler:
 
             self._waiting.popleft()
             self.block_manager.allocate(seq.seq_id, prompt_tokens)
+            seq.block_table = self.block_manager.get_block_table(seq.seq_id)
             seq.status = SequenceStatus.RUNNING
             out.prefill_seqs.append(seq)
             budgeted_tokens += prompt_tokens

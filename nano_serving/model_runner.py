@@ -59,23 +59,20 @@ _current_ctx: Optional[_ForwardCtx] = None
 
 def _make_patched_forward(original_forward, layer_idx: int):
     """
-    Return a new forward function that wraps the original Qwen2 attention
-    forward, intercepting K/V to go through PagedKVCache.
-
-    The wrapper is intentionally minimal: it calls the original forward
-    to get Q/K/V projections and RoPE, then replaces the attention step.
+    Return a new forward function compatible with the transformers ≥4.45
+    Qwen2Attention API:
+      - position_embeddings=(cos, sin) is passed in by the decoder layer
+      - attributes live on self_attn.config, not directly on self_attn
+      - returns (attn_output, attn_weights) — 2 values
     """
 
     def patched_forward(
         self_attn,
         hidden_states: torch.Tensor,
+        position_embeddings,            # (cos, sin) — required in new API
         attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        past_key_values=None,           # new name (was past_key_value)
         cache_position=None,
-        position_embeddings=None,
         **kwargs,
     ):
         global _current_ctx
@@ -83,25 +80,17 @@ def _make_patched_forward(original_forward, layer_idx: int):
 
         bsz, q_len, _ = hidden_states.size()
 
-        # ── Q / K / V projections ─────────────────────────────────────────
-        query = self_attn.q_proj(hidden_states)
-        key   = self_attn.k_proj(hidden_states)
-        value = self_attn.v_proj(hidden_states)
-
-        num_q_heads  = self_attn.num_heads
-        num_kv_heads = self_attn.num_key_value_heads
+        num_q_heads  = self_attn.config.num_attention_heads
+        num_kv_heads = self_attn.config.num_key_value_heads
         head_dim     = self_attn.head_dim
 
-        query = query.view(bsz, q_len, num_q_heads,  head_dim).transpose(1, 2)
-        key   = key.view(  bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
-        value = value.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        # ── Q / K / V projections ─────────────────────────────────────────
+        query = self_attn.q_proj(hidden_states).view(bsz, q_len, num_q_heads,  head_dim).transpose(1, 2)
+        key   = self_attn.k_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        value = self_attn.v_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
 
-        # ── RoPE ──────────────────────────────────────────────────────────
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-        else:
-            cos, sin = self_attn.rotary_emb(value, position_ids)
-
+        # ── RoPE (cos/sin already computed by the model's rotary emb layer) ─
+        cos, sin = position_embeddings
         from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
@@ -115,32 +104,27 @@ def _make_patched_forward(original_forward, layer_idx: int):
                 ctx.is_decode,
             )
         else:
-            # Fallback: no paging (e.g., during weight-loading warmup)
             key_full, value_full = key, value
 
         # ── Repeat KV heads for GQA ───────────────────────────────────────
-        # key_full / value_full: [bsz, num_kv_heads, seq_len, head_dim]
-        # query:                 [bsz, num_q_heads,  q_len,   head_dim]
         if num_q_heads != num_kv_heads:
             n_rep = num_q_heads // num_kv_heads
-            key_full   = key_full.repeat_interleave(  n_rep, dim=1)
+            key_full   = key_full.repeat_interleave(n_rep, dim=1)
             value_full = value_full.repeat_interleave(n_rep, dim=1)
 
         # ── Scaled dot-product attention ──────────────────────────────────
-        # Use causal mask: decode sees full history, prefill is causal.
-        seq_len_k = key_full.shape[2]
         attn_out = F.scaled_dot_product_attention(
             query, key_full, value_full,
             attn_mask=None,
             dropout_p=0.0,
-            is_causal=(q_len > 1),   # causal for prefill, not for single-token decode
+            is_causal=(q_len > 1),   # causal for prefill; no mask needed for single decode token
         )
 
         # ── Output projection ─────────────────────────────────────────────
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         attn_out = self_attn.o_proj(attn_out)
 
-        return attn_out, None, None   # (hidden, attn_weights, past_kv)
+        return attn_out, None   # (hidden_states, attn_weights)  — 2 values per new API
 
     return patched_forward
 
@@ -172,7 +156,7 @@ class ModelRunner:
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_cfg.model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map={"": device},
             trust_remote_code=True,
         )

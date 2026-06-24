@@ -3,11 +3,13 @@ Paged KV Cache — GPU tensor management for PagedAttention.
 
 The physical KV cache is a pair of pre-allocated tensors per layer:
 
-  k_cache[layer]: [num_blocks, num_kv_heads, block_size, head_dim]  fp16
-  v_cache[layer]: [num_blocks, num_kv_heads, block_size, head_dim]  fp16
+  k_cache[layer]: [num_blocks, block_size, num_kv_heads, head_dim]  fp16
+  v_cache[layer]: [num_blocks, block_size, num_kv_heads, head_dim]  fp16
 
-Each "physical block" holds block_size tokens of K (or V) for one layer,
-for all KV heads simultaneously.
+Layout is (num_blocks, block_size, ...) so that
+  kc.view(-1, num_kv_heads, head_dim)
+produces a contiguous flat view indexed by (block * block_size + slot).
+This enables vectorised scatter/gather via torch.gather without copying.
 
 During a forward pass, PagedKVCache is passed as past_key_value to each
 attention layer. The attention layer calls:
@@ -16,7 +18,7 @@ attention layer. The attention layer calls:
                                   block_tables, seq_lens, is_decode)
 
 Which does:
-  1. Write new_k / new_v into the appropriate block slots
+  1. Write new_k / new_v into the appropriate block slots (scatter)
   2. Gather the full K/V history for each sequence from its block table
   3. Return gathered K/V for attention computation
 
